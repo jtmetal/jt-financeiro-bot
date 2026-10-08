@@ -1,6 +1,7 @@
 from flask import Flask, request
 import os
 import json
+import tempfile
 import requests
 from datetime import date
 
@@ -41,13 +42,68 @@ def enviar_mensagem(chat_id, texto, botoes=None):
     resposta = requests.post(
         f"{TELEGRAM_API}/sendMessage",
         json=payload,
-        timeout=15
+        timeout=20
     )
 
-    print("RESPOSTA TELEGRAM:", resposta.text)
+    print("TELEGRAM:", resposta.text)
+
+
+def transcrever_audio(file_id):
+    # Descobre o caminho do arquivo dentro do Telegram
+    resposta = requests.get(
+        f"{TELEGRAM_API}/getFile",
+        params={"file_id": file_id},
+        timeout=20
+    )
+
+    dados = resposta.json()
+
+    if not dados.get("ok"):
+        raise Exception("Telegram não conseguiu localizar o áudio.")
+
+    file_path = dados["result"]["file_path"]
+
+    # Baixa o áudio
+    url_audio = (
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    )
+
+    audio = requests.get(
+        url_audio,
+        timeout=30
+    )
+
+    audio.raise_for_status()
+
+    # Salva temporariamente como OGG
+    with tempfile.NamedTemporaryFile(
+        suffix=".ogg",
+        delete=False
+    ) as arquivo:
+        arquivo.write(audio.content)
+        caminho = arquivo.name
+
+    try:
+        with open(caminho, "rb") as arquivo_audio:
+            transcricao = openai.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=arquivo_audio,
+                language="pt"
+            )
+
+        return transcricao.text.strip()
+
+    finally:
+        try:
+            os.remove(caminho)
+        except Exception:
+            pass
 
 
 def buscar_cliente_por_nome(nome):
+    if not nome:
+        return []
+
     resultado = (
         supabase
         .table("clientes")
@@ -130,13 +186,15 @@ def interpretar_texto(texto):
     hoje = date.today().isoformat()
 
     prompt = f"""
-Você é o interpretador financeiro da empresa JT Metal Serralheria.
+Você interpreta mensagens financeiras da empresa JT Metal Serralheria.
 
 Hoje é {hoje}.
 
-Leia a mensagem do usuário e identifique UMA ação.
+A pessoa pode falar de maneira informal, como fala normalmente no WhatsApp.
 
-Ações permitidas:
+Identifique UMA ação principal.
+
+Ações possíveis:
 - cadastrar_cliente
 - criar_obra
 - registrar_despesa
@@ -145,15 +203,20 @@ Ações permitidas:
 - consultar_clientes
 - desconhecido
 
-Regras:
+REGRAS:
 
-1. cadastrar_cliente:
-Quando a pessoa disser algo como:
-"cadastre o cliente Augusto"
-"novo cliente João"
+CADASTRAR CLIENTE
+Exemplos:
+"cadastre o Augusto"
+"cliente novo João"
+"coloca o Carlos como cliente"
 
-2. criar_obra:
-Quando houver um serviço/venda fechado com cliente.
+CRIAR OBRA / VENDA
+Exemplos:
+"fechei um portão pro Augusto por 12 mil e ele deu 6 mil de entrada"
+"peguei um serviço do Carlos de 8 mil"
+"vendi um gradil pro João por 20 mil, recebeu 10 mil de entrada"
+
 Extraia:
 cliente
 servico
@@ -161,35 +224,45 @@ valor_total
 valor_entrada
 prazo_entrega
 
-Exemplo:
-"Fechei um portão com Augusto por 21000, ele deu 10500 de entrada e entrego dia 30"
+REGISTRAR DESPESA
+Exemplos:
+"gastei mil reais de ferro pro Augusto"
+"paguei 350 de tinta na obra do João"
+"comprei 2200 de material pro Carlos"
 
-3. registrar_despesa:
 Extraia:
 cliente
 descricao
 categoria
 valor
 
-Exemplo:
-"gastei 3200 de gradil pro Augusto"
+REGISTRAR RECEBIMENTO
+Exemplos:
+"Augusto me pagou 5000"
+"entrou mais 3 mil do João"
+"recebi 1200 do Carlos"
 
-4. registrar_recebimento:
-Extraia:
-cliente
-descricao
-valor
+CONSULTAR OBRA
+Exemplos:
+"quanto já gastei no Augusto"
+"quanto o Carlos ainda me deve"
+"como está a obra do João"
 
-Exemplo:
-"Augusto me pagou mais 5000"
+CONSULTAR CLIENTES
+Exemplos:
+"quais clientes eu tenho"
+"me mostra os clientes"
 
-5. consultar_obra:
-Quando perguntarem quanto gastou, recebeu, falta receber ou situação de um cliente.
+Valores falados como:
+"mil" = 1000
+"mil e quinhentos" = 1500
+"12 mil" = 12000
+"vinte e um mil" = 21000
 
-Nunca invente valores.
-Se alguma informação não existir, use null.
+Nunca invente informações.
+Se não existir informação, use null.
 
-Responda SOMENTE JSON válido neste formato:
+Responda SOMENTE JSON válido, sem markdown:
 
 {{
   "acao": "",
@@ -208,16 +281,19 @@ Mensagem:
 """
 
     resposta = openai.responses.create(
-        model="gpt-6-luna",
+        model="gpt-4.1-mini",
         input=prompt
     )
 
     texto_resposta = resposta.output_text.strip()
 
     if texto_resposta.startswith("```"):
-        texto_resposta = texto_resposta.replace("```json", "")
-        texto_resposta = texto_resposta.replace("```", "")
-        texto_resposta = texto_resposta.strip()
+        texto_resposta = (
+            texto_resposta
+            .replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
 
     return json.loads(texto_resposta)
 
@@ -234,12 +310,12 @@ def mostrar_confirmacao(chat_id, dados):
 
     elif acao == "criar_obra":
         mensagem = (
-            "🛠 Nova obra/serviço\n\n"
+            "🛠 Nova obra / serviço\n\n"
             f"Cliente: {dados.get('cliente')}\n"
-            f"Serviço: {dados.get('servico')}\n"
-            f"Valor total: R$ {dados.get('valor_total') or 0:,.2f}\n"
-            f"Entrada: R$ {dados.get('valor_entrada') or 0:,.2f}\n"
-            f"Prazo: {dados.get('prazo_entrega') or 'não informado'}\n\n"
+            f"Serviço: {dados.get('servico') or 'Não informado'}\n"
+            f"Valor total: R$ {float(dados.get('valor_total') or 0):,.2f}\n"
+            f"Entrada: R$ {float(dados.get('valor_entrada') or 0):,.2f}\n"
+            f"Prazo: {dados.get('prazo_entrega') or 'Não informado'}\n\n"
             "Confirmar?"
         )
 
@@ -247,9 +323,9 @@ def mostrar_confirmacao(chat_id, dados):
         mensagem = (
             "💸 Nova despesa\n\n"
             f"Cliente: {dados.get('cliente')}\n"
-            f"Descrição: {dados.get('descricao')}\n"
-            f"Categoria: {dados.get('categoria') or 'não informada'}\n"
-            f"Valor: R$ {dados.get('valor') or 0:,.2f}\n\n"
+            f"Descrição: {dados.get('descricao') or 'Despesa'}\n"
+            f"Categoria: {dados.get('categoria') or 'Não informada'}\n"
+            f"Valor: R$ {float(dados.get('valor') or 0):,.2f}\n\n"
             "Confirmar lançamento?"
         )
 
@@ -257,8 +333,7 @@ def mostrar_confirmacao(chat_id, dados):
         mensagem = (
             "💰 Novo recebimento\n\n"
             f"Cliente: {dados.get('cliente')}\n"
-            f"Descrição: {dados.get('descricao') or 'Recebimento'}\n"
-            f"Valor: R$ {dados.get('valor') or 0:,.2f}\n\n"
+            f"Valor: R$ {float(dados.get('valor') or 0):,.2f}\n\n"
             "Confirmar recebimento?"
         )
 
@@ -287,7 +362,7 @@ def executar_pendencia(chat_id):
     if not pendencia:
         enviar_mensagem(
             chat_id,
-            "Não existe nenhum lançamento aguardando confirmação."
+            "Não existe lançamento aguardando confirmação."
         )
         return
 
@@ -295,7 +370,6 @@ def executar_pendencia(chat_id):
     dados = pendencia["dados"]
 
     if acao == "cadastrar_cliente":
-
         nome = dados.get("cliente")
 
         supabase.table("clientes").insert({
@@ -309,14 +383,12 @@ def executar_pendencia(chat_id):
         )
 
     elif acao == "criar_obra":
-
         nome_cliente = dados.get("cliente")
 
         clientes = buscar_cliente_por_nome(nome_cliente)
 
         if clientes:
             cliente = clientes[0]
-
         else:
             resultado = supabase.table("clientes").insert({
                 "nome": nome_cliente,
@@ -336,7 +408,7 @@ def executar_pendencia(chat_id):
 
         obra = resultado_obra.data[0]
 
-        entrada = dados.get("valor_entrada") or 0
+        entrada = float(dados.get("valor_entrada") or 0)
 
         if entrada > 0:
             supabase.table("movimentacoes").insert({
@@ -349,19 +421,19 @@ def executar_pendencia(chat_id):
                 "criado_por": str(chat_id)
             }).execute()
 
-        saldo = (dados.get("valor_total") or 0) - entrada
+        valor_total = float(dados.get("valor_total") or 0)
+        saldo = valor_total - entrada
 
         enviar_mensagem(
             chat_id,
             "✅ Obra cadastrada!\n\n"
             f"Cliente: {nome_cliente}\n"
-            f"Valor total: R$ {(dados.get('valor_total') or 0):,.2f}\n"
+            f"Valor total: R$ {valor_total:,.2f}\n"
             f"Recebido: R$ {entrada:,.2f}\n"
             f"A receber: R$ {saldo:,.2f}"
         )
 
     elif acao == "registrar_despesa":
-
         cliente, obra = buscar_obra_por_cliente(
             dados.get("cliente")
         )
@@ -375,16 +447,18 @@ def executar_pendencia(chat_id):
         elif not obra:
             enviar_mensagem(
                 chat_id,
-                "❌ Encontrei o cliente, mas ele não possui uma obra aberta."
+                "❌ Encontrei o cliente, mas ele não possui obra aberta."
             )
 
         else:
+            valor = float(dados.get("valor") or 0)
+
             supabase.table("movimentacoes").insert({
                 "obra_id": obra["id"],
                 "tipo": "despesa",
                 "descricao": dados.get("descricao") or "Despesa",
                 "categoria": dados.get("categoria"),
-                "valor": dados.get("valor"),
+                "valor": valor,
                 "pago": True,
                 "criado_por": str(chat_id)
             }).execute()
@@ -393,11 +467,10 @@ def executar_pendencia(chat_id):
                 chat_id,
                 "✅ Despesa registrada.\n\n"
                 f"Cliente: {cliente['nome']}\n"
-                f"Valor: R$ {dados.get('valor'):,.2f}"
+                f"Valor: R$ {valor:,.2f}"
             )
 
     elif acao == "registrar_recebimento":
-
         cliente, obra = buscar_obra_por_cliente(
             dados.get("cliente")
         )
@@ -411,16 +484,18 @@ def executar_pendencia(chat_id):
         elif not obra:
             enviar_mensagem(
                 chat_id,
-                "❌ Esse cliente não possui uma obra aberta."
+                "❌ Esse cliente não possui obra aberta."
             )
 
         else:
+            valor = float(dados.get("valor") or 0)
+
             supabase.table("movimentacoes").insert({
                 "obra_id": obra["id"],
                 "tipo": "entrada",
                 "descricao": dados.get("descricao") or "Recebimento",
                 "categoria": "Recebimento",
-                "valor": dados.get("valor"),
+                "valor": valor,
                 "pago": True,
                 "criado_por": str(chat_id)
             }).execute()
@@ -429,14 +504,13 @@ def executar_pendencia(chat_id):
                 chat_id,
                 "✅ Recebimento registrado.\n\n"
                 f"Cliente: {cliente['nome']}\n"
-                f"Valor: R$ {dados.get('valor'):,.2f}"
+                f"Valor: R$ {valor:,.2f}"
             )
 
     excluir_pendencia(chat_id)
 
 
 def consultar_obra(chat_id, nome_cliente):
-
     cliente, obra = buscar_obra_por_cliente(nome_cliente)
 
     if not cliente:
@@ -476,7 +550,6 @@ def consultar_obra(chat_id, nome_cliente):
     valor_total = float(obra["valor_total"] or 0)
 
     falta_receber = valor_total - entradas
-
     resultado_atual = entradas - despesas
 
     enviar_mensagem(
@@ -492,101 +565,7 @@ def consultar_obra(chat_id, nome_cliente):
     )
 
 
-@app.get("/")
-def inicio():
-    return "JT Financeiro está online!"
-
-
-@app.get("/configurar-webhook")
-def configurar_webhook():
-    webhook_url = "https://jt-financeiro-bot.onrender.com/webhook"
-
-    resposta = requests.post(
-        f"{TELEGRAM_API}/setWebhook",
-        json={
-            "url": webhook_url,
-            "secret_token": SECRET_TOKEN,
-            "drop_pending_updates": True
-        },
-        timeout=15
-    )
-
-    return resposta.json()
-
-
-@app.get("/diagnostico-webhook")
-def diagnostico_webhook():
-    resposta = requests.get(
-        f"{TELEGRAM_API}/getWebhookInfo",
-        timeout=15
-    )
-
-    return resposta.json()
-
-
-@app.post("/webhook")
-def webhook():
-
-    if SECRET_TOKEN:
-        recebido = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token"
-        )
-
-        if recebido != SECRET_TOKEN:
-            return "Não autorizado", 403
-
-    dados = request.get_json(silent=True) or {}
-
-    callback = dados.get("callback_query")
-
-    if callback:
-        chat_id = callback["message"]["chat"]["id"]
-        escolha = callback["data"]
-
-        if escolha == "confirmar":
-            executar_pendencia(chat_id)
-
-        elif escolha == "cancelar":
-            excluir_pendencia(chat_id)
-
-            enviar_mensagem(
-                chat_id,
-                "❌ Lançamento cancelado."
-            )
-
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={
-                "callback_query_id": callback["id"]
-            },
-            timeout=10
-        )
-
-        return "ok", 200
-
-    mensagem = dados.get("message")
-
-    if not mensagem:
-        return "ok", 200
-
-    chat_id = mensagem["chat"]["id"]
-    texto = mensagem.get("text", "").strip()
-
-    if texto == "/start":
-        enviar_mensagem(
-            chat_id,
-            "🤖 JT Financeiro\n\n"
-            "Pode falar comigo normalmente.\n\n"
-            "Exemplos:\n"
-            "• Cadastre o cliente Augusto\n"
-            "• Fechei um portão com Augusto por 21 mil e recebi 10.500 de entrada\n"
-            "• Gastei 3200 de gradil pro Augusto\n"
-            "• Augusto me pagou 5000\n"
-            "• Quanto já gastei no Augusto?"
-        )
-
-        return "ok", 200
-
+def processar_texto(chat_id, texto):
     try:
         interpretacao = interpretar_texto(texto)
 
@@ -631,7 +610,6 @@ def webhook():
                     chat_id,
                     "Nenhum cliente cadastrado."
                 )
-
             else:
                 lista = "\n".join(
                     f"• {c['nome']}"
@@ -646,16 +624,191 @@ def webhook():
         else:
             enviar_mensagem(
                 chat_id,
-                "Não consegui entender esse lançamento.\n\n"
-                "Pode escrever de outra forma?"
+                "Não consegui entender.\n\n"
+                "Tente falar de outra forma."
             )
 
     except Exception as erro:
-        print("ERRO:", erro)
+        print("ERRO PROCESSAMENTO:", erro)
 
         enviar_mensagem(
             chat_id,
             "❌ Tive um erro ao interpretar essa mensagem."
+        )
+
+
+@app.get("/")
+def inicio():
+    return "JT Financeiro está online!"
+
+
+@app.get("/configurar-webhook")
+def configurar_webhook():
+    webhook_url = "https://jt-financeiro-bot.onrender.com/webhook"
+
+    resposta = requests.post(
+        f"{TELEGRAM_API}/setWebhook",
+        json={
+            "url": webhook_url,
+            "secret_token": SECRET_TOKEN,
+            "drop_pending_updates": True
+        },
+        timeout=15
+    )
+
+    return resposta.json()
+
+
+@app.get("/diagnostico-webhook")
+def diagnostico_webhook():
+    resposta = requests.get(
+        f"{TELEGRAM_API}/getWebhookInfo",
+        timeout=15
+    )
+
+    return resposta.json()
+
+
+@app.post("/webhook")
+def webhook():
+    if SECRET_TOKEN:
+        recebido = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        )
+
+        if recebido != SECRET_TOKEN:
+            return "Não autorizado", 403
+
+    dados = request.get_json(silent=True) or {}
+
+    # BOTÕES DE CONFIRMAÇÃO
+    callback = dados.get("callback_query")
+
+    if callback:
+        chat_id = callback["message"]["chat"]["id"]
+        escolha = callback["data"]
+
+        if escolha == "confirmar":
+            executar_pendencia(chat_id)
+
+        elif escolha == "cancelar":
+            excluir_pendencia(chat_id)
+
+            enviar_mensagem(
+                chat_id,
+                "❌ Lançamento cancelado."
+            )
+
+        requests.post(
+            f"{TELEGRAM_API}/answerCallbackQuery",
+            json={
+                "callback_query_id": callback["id"]
+            },
+            timeout=10
+        )
+
+        return "ok", 200
+
+    mensagem = dados.get("message")
+
+    if not mensagem:
+        return "ok", 200
+
+    chat_id = mensagem["chat"]["id"]
+
+    # TEXTO
+    texto = mensagem.get("text", "").strip()
+
+    if texto == "/start":
+        enviar_mensagem(
+            chat_id,
+            "🤖 JT Financeiro\n\n"
+            "Pode escrever ou mandar áudio normalmente.\n\n"
+            "Exemplos:\n"
+            "• Cadastre o cliente Augusto\n"
+            "• Fechei um portão pro Augusto por 21 mil e recebi 10.500 de entrada\n"
+            "• Gastei 3200 de gradil pro Augusto\n"
+            "• Augusto me pagou 5000\n"
+            "• Quanto já gastei no Augusto?"
+        )
+
+        return "ok", 200
+
+    # ÁUDIO DE VOZ
+    voz = mensagem.get("voice")
+
+    if voz:
+        try:
+            enviar_mensagem(
+                chat_id,
+                "🎙️ Recebi seu áudio. Estou transcrevendo..."
+            )
+
+            transcricao = transcrever_audio(
+                voz["file_id"]
+            )
+
+            print("TRANSCRIÇÃO:", transcricao)
+
+            enviar_mensagem(
+                chat_id,
+                f"📝 Entendi:\n\n{transcricao}"
+            )
+
+            processar_texto(
+                chat_id,
+                transcricao
+            )
+
+        except Exception as erro:
+            print("ERRO AUDIO:", erro)
+
+            enviar_mensagem(
+                chat_id,
+                "❌ Não consegui processar esse áudio."
+            )
+
+        return "ok", 200
+
+    # ARQUIVO DE ÁUDIO
+    audio = mensagem.get("audio")
+
+    if audio:
+        try:
+            enviar_mensagem(
+                chat_id,
+                "🎙️ Recebi seu áudio. Estou transcrevendo..."
+            )
+
+            transcricao = transcrever_audio(
+                audio["file_id"]
+            )
+
+            enviar_mensagem(
+                chat_id,
+                f"📝 Entendi:\n\n{transcricao}"
+            )
+
+            processar_texto(
+                chat_id,
+                transcricao
+            )
+
+        except Exception as erro:
+            print("ERRO AUDIO:", erro)
+
+            enviar_mensagem(
+                chat_id,
+                "❌ Não consegui processar esse áudio."
+            )
+
+        return "ok", 200
+
+    # MENSAGEM NORMAL
+    if texto:
+        processar_texto(
+            chat_id,
+            texto
         )
 
     return "ok", 200
