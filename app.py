@@ -25,6 +25,7 @@ def enviar_mensagem(chat_id, texto):
 def inicio():
     return "JT Financeiro está online!"
 
+
 @app.get("/configurar-webhook")
 def configurar_webhook():
     url_webhook = "https://jt-financeiro-bot.onrender.com/webhook"
@@ -39,6 +40,8 @@ def configurar_webhook():
     )
 
     return resposta.json()
+
+
 @app.post("/webhook")
 def webhook():
     if SECRET_TOKEN:
